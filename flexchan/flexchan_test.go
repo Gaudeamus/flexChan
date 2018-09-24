@@ -5,6 +5,7 @@ import (
 	"time"
 	"sync/atomic"
 	"sync"
+	"sort"
 )
 
 var sendCount = int64(0)
@@ -17,21 +18,24 @@ type ctype struct {
 
 func TestFlexChan(t *testing.T) {
 
-	fc := NewFlexChan(ctype{},10)
+	fc := NewFlexChan(10)
 
-	fc.SetIntervalWorker(func(stat FlexChanStat) {},time.Second)
+	fc.SetStatInterval(time.Second)
 
-	fc.SetReceiver(func(val interface{}, ok bool) {
-		v := val.(ctype)
-		atomic.AddInt64(&getChechsum, int64(v.val))
-		atomic.AddInt64(&getCount, 1)
+	fc.SetReceiver(func(val FlexChanVal, ok bool) {
+		if val.Stat == nil && val.Val != nil {
+			cv := val.Val
+			v := cv.(ctype)
+			atomic.AddInt64(&getChechsum, int64(v.val))
+			atomic.AddInt64(&getCount, 1)
+		}
 	})
 
 	wg := sync.WaitGroup{}
 	for i:=0; i< 1000; i++ {
 		wg.Add(1)
 		go func(int2 int) {
-			sendWorker3(fc,int2)
+			sendWorker(fc,int2)
 			wg.Done()
 		}(i+1)
 	}
@@ -47,7 +51,7 @@ func TestFlexChan(t *testing.T) {
 	}
 }
 
-func sendWorker3(fc *FlexChan,id int) {
+func sendWorker(fc *FlexChan,id int) {
 	for i:= 0; i < 1000; i++ {
 		v := id*1000+i
 		atomic.AddInt64(&sendChechsum, int64(v))
@@ -61,4 +65,41 @@ func sendWorker3(fc *FlexChan,id int) {
 		atomic.AddInt64(&sendCount, 1)
 		fc.Send(ctype{id,v})
 	}
+}
+
+func TestFlexChanUserChan(t *testing.T) {
+
+	userChan := make(chan chan []int, 1)
+	fc := NewFlexChan(10)
+	userMap := map[int]struct{}{}
+	fc.SetReceiver(func(fcv FlexChanVal, ok bool) {
+		switch fcv.Val.(type) {
+		case int: //value from fc.Send
+			val := fcv.Val.(int)
+			userMap[val] = struct{}{}
+		case chan []int: //value from userChan
+			ch := fcv.Val.(chan []int)
+			var list []int
+			for i,_ := range userMap {
+				list = append(list, i)
+			}
+			sort.Ints(list)
+			ch <- list
+		}
+	})
+	fc.AddScanChan(userChan)
+	fc.Send(2)
+	fc.Send(2)
+	fc.Send(3)
+	time.Sleep(time.Millisecond)
+	requestChan := make(chan []int)
+	userChan <- requestChan
+	list := <-requestChan
+	close(requestChan)
+	if len(list) != 2 {
+		t.Errorf("list len %d != 2 ",len(list))
+	} else if list[0] != 2 || list[1] != 3 {
+		t.Errorf("list content not matched")
+	}
+
 }

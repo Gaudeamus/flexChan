@@ -1,120 +1,150 @@
 package flexchan
 
 import (
-	"reflect"
 	"time"
 	"sync/atomic"
+	"reflect"
 )
 
 type FlexChan struct{
-	userWorkerInterval time.Duration
-	userWorker func(FlexChanStat)
-	userTicker *time.Ticker
-	chanId   int64
-	mainChan reflect.Value
-	workChan chan interface{}
-	curCap   int
+	statInterval  time.Duration
+	userWorker    func(val FlexChanVal)
+	statTicker    *time.Ticker
+	chanId        int64
+	mainChan      chan FlexChanVal
+	workChan      chan FlexChanVal
+	curCap        int
+	userCh        chan FlexChanVal
+	resetSelectCh chan struct{}
 }
 
 type FlexChanStat struct {
 	Len, Cap int
+	T	time.Time
+}
+
+type FlexChanVal struct {
+	Stat *FlexChanStat
+	Val  interface{}
 }
 
 
-func NewFlexChan(chanType interface{}, initialLen int) (fc *FlexChan) {
-	v := reflect.ValueOf(chanType)
-	vct := reflect.ChanOf(reflect.BothDir,v.Type())
+func NewFlexChan(initialLen int) (fc *FlexChan) {
 	fc = new(FlexChan)
-	fc.mainChan = reflect.MakeChan(vct,initialLen)
-	fc.workChan = make(chan interface{}, 100)
+	fc.mainChan = make(chan FlexChanVal, initialLen)
+	fc.workChan = make(chan FlexChanVal, 100)
+	fc.resetSelectCh = make(chan struct{}, 1)
 	fc.curCap = initialLen
 	go fc.worker()
 	return
 }
 
 func (fc *FlexChan) Send(val interface{}) {
-	fc.workChan <- val
+	fc.workChan <- FlexChanVal{Val:val}
 }
 
-func (fc *FlexChan) SetIntervalWorker(worker func(FlexChanStat), interval time.Duration) (){
-	if interval == 0 || worker == nil {
+func (fc *FlexChan) SetStatInterval(interval time.Duration) (){
+	if interval == 0 {
 		return
 	}
-	fc.userWorkerInterval = interval
-	fc.userWorker = worker
-	if fc.userTicker != nil {
-		fc.userTicker.Stop()
+	fc.statInterval = interval
+	if fc.statTicker != nil {
+		fc.statTicker.Stop()
 	}
-	fc.userTicker = time.NewTicker(fc.userWorkerInterval)
+	fc.statTicker = time.NewTicker(fc.statInterval)
+	fc.resetSelectCh <- struct{}{}
 }
 
-func (fc *FlexChan) SetReceiver(receiver func(val interface{}, ok bool)) (){
-
+func (fc *FlexChan) AddScanChan(ch interface{}) (){
+	rch := reflect.ValueOf(ch)
+	if rch.Kind() != reflect.Chan {
+		panic("not a chan")
+	}
+	if fc.userCh == nil {
+		fc.userCh = make(chan FlexChanVal, 100)
+		fc.resetSelectCh <- struct{}{}
+	}
+	go func() { //scan
+		for {
+			cc, val, ok := reflect.Select([]reflect.SelectCase{
+				{Dir:reflect.SelectRecv,Chan:rch, Send:reflect.Value{}},
+			});
+			if !ok { //chan is closed
+				return
+			}
+			if cc == 0 {
+				fc.userCh <- FlexChanVal{Val:val.Interface()}
+			}
+		}
+	}()
+}
+func (fc *FlexChan) SetReceiver(receiver func(fcv FlexChanVal, ok bool)) (){
 	go func() {
 		for {
-			sel := []reflect.SelectCase{{Dir:reflect.SelectRecv,Chan:fc.mainChan, Send:reflect.Value{}}}
 			id := atomic.LoadInt64(&fc.chanId)
-			_,rv,ok := reflect.Select(sel)
-			if !ok && atomic.LoadInt64(&fc.chanId) != id {
-				continue //channel is closed by flexchan.receiver
+			select {
+			case rv, ok := <-fc.mainChan:
+				if !ok && atomic.LoadInt64(&fc.chanId) != id {
+					continue //channel is closed by FlexChan.receiver
+				}
+				receiver(rv, ok)
 			}
-			receiver(rv.Interface(), ok)
 		}
 	}()
 }
 
 func (fc *FlexChan) worker() {
-	tic := time.Tick(time.Minute * 15)
+	descendTicker := time.Tick(time.Minute * 15)
 
-	if fc.userWorkerInterval != 0 {
-		fc.userTicker = time.NewTicker(fc.userWorkerInterval)
+	if fc.statInterval != 0 {
+		fc.statTicker = time.NewTicker(fc.statInterval)
+	} else {
+		fc.statTicker = &time.Ticker{}
 	}
 	updateChan := func() {
-		newMainChan := reflect.MakeChan(fc.mainChan.Type(), fc.curCap)
-		cases := []reflect.SelectCase{
-			{Dir:reflect.SelectRecv,Chan:fc.mainChan, Send:reflect.Value{}},
-			{Dir:reflect.SelectDefault,Chan:reflect.Value{}, Send:reflect.Value{}},
-		}
+		newMainChan :=  make(chan FlexChanVal, fc.curCap)
 		for copyfor:=true; copyfor;{
-			cc,val,_ := reflect.Select(cases)
-			switch cc {
-			case 0: //get value
-				newMainChan.Send(val)
-			case 1: //default
+			select {
+			case val := <- fc.mainChan: //get value
+				newMainChan <- val
+			default: //default
 				copyfor=false
 			}
 		}
 		oldMainChan := fc.mainChan
 		fc.mainChan = newMainChan
 		atomic.AddInt64(&fc.chanId,1)
-		oldMainChan.Close()
+		close(oldMainChan)
+	}
+	send2MainWithUpdate := func(val FlexChanVal, newcap int) {
+		resend :
+		select {
+		case fc.mainChan <- val:
+			//send ok
+		default:
+			fc.curCap = newcap
+			updateChan()
+			goto resend
+		}
 	}
 	for {
 		select {
-		case <-fc.userTicker.C:
-			fc.userWorker(FlexChanStat{fc.mainChan.Len(),fc.curCap})
-		case <-tic:
-			curLen := fc.mainChan.Len()
+		case <-fc.statTicker.C:
+			send2MainWithUpdate(FlexChanVal{Stat:&FlexChanStat{Len: len(fc.mainChan),Cap:fc.curCap, T:time.Now()}}, fc.curCap*10)
+		case <-descendTicker:
+			curLen := len(fc.mainChan)
 			if fc.curCap > 10 && curLen < fc.curCap/4 {
 				fc.curCap /= 2
 				updateChan()
 			}
 		case v:= <-fc.workChan:
-		resend:
-			cases := []reflect.SelectCase{
-				{Dir:reflect.SelectSend,Chan:fc.mainChan, Send:reflect.ValueOf(v)},
-				{Dir:reflect.SelectDefault,Chan:reflect.Value{}, Send:reflect.Value{}},
-			}
-			cc,_,_ := reflect.Select(cases)
-			switch cc {
-			case 0:
-				//send ok
-			case 1:
-				fc.curCap *= 10
-				updateChan()
-				goto resend
-			}
+			send2MainWithUpdate(v, fc.curCap*10)
+		case v:= <-fc.userCh:
+			send2MainWithUpdate(v, fc.curCap*10)
+		case <-fc.resetSelectCh:
+			//continue
 		}
 	}
 }
+
 
